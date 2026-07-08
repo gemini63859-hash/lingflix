@@ -325,6 +325,26 @@ nav button.on .ico{filter:none}
       <div><h1 id="myName">공주님</h1><div class="sub">오늘도 파이팅!</div></div>
     </div>
     <div class="stat-grid" id="myStats"></div>
+    <h3>☁️ 계정 & 동기화</h3>
+    <div class="card">
+      <div id="syncLoggedOut">
+        <p class="sub" style="margin-bottom:12px">Google 로그인하면 북마크·코스·스트릭·달성도가 <b>모든 기기에서 자동으로 이어져요.</b></p>
+        <div id="fbSetupWrap">
+          <label style="margin-top:0">Firebase 설정 붙여넣기 (최초 1회)</label>
+          <textarea id="fbCfgInput" rows="5" placeholder='Firebase 콘솔에서 복사한 firebaseConfig = { apiKey: "...", ... } 부분을 통째로 붙여넣어요'></textarea>
+          <p class="sub" style="margin:8px 0 12px">📖 만드는 법은 README의 <b>"로그인 동기화 세팅 (5분)"</b> 참고!</p>
+        </div>
+        <button class="btn" onclick="fbLogin()">🔐 Google로 로그인</button>
+      </div>
+      <div id="syncLoggedIn" style="display:none">
+        <div class="row"><div class="grow"><b id="syncEmail"></b><div class="sub" id="syncStatus" style="margin-top:3px">동기화 준비 중…</div></div></div>
+        <div class="row" style="margin-top:14px">
+          <button class="btn sm" onclick="cloudSyncNow()">🔄 지금 동기화</button>
+          <button class="btn sm gray" onclick="fbLogout()">로그아웃</button>
+        </div>
+        <p class="sub" style="margin-top:10px">🔑 Claude API 키는 보안을 위해 동기화되지 않아요 (기기마다 입력)</p>
+      </div>
+    </div>
     <h3>⚙️ AI 설정</h3>
     <div class="card">
       <label style="margin-top:0">Claude API 키</label>
@@ -483,8 +503,8 @@ nav button.on .ico{filter:none}
 const mem = {};
 const store = {
   get(k,d){ try{ const v=localStorage.getItem('lf_'+k); return v===null ? (k in mem?mem[k]:d) : JSON.parse(v);}catch(e){ return k in mem?mem[k]:d;} },
-  set(k,v){ mem[k]=v; try{ localStorage.setItem('lf_'+k, JSON.stringify(v)); }catch(e){} },
-  del(k){ delete mem[k]; try{ localStorage.removeItem('lf_'+k); }catch(e){} }
+  set(k,v){ mem[k]=v; try{ localStorage.setItem('lf_'+k, JSON.stringify(v)); }catch(e){} try{ queueSync(k); }catch(e){} },
+  del(k){ delete mem[k]; try{ localStorage.removeItem('lf_'+k); }catch(e){} try{ queueSync(k); }catch(e){} }
 };
 function esc(s){ return String(s??'').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;'); }
 function uid(){ return Date.now().toString(36)+Math.random().toString(36).slice(2,7); }
@@ -1204,6 +1224,7 @@ function renderMy(){
   document.getElementById('goalQuiz').value=g.quiz;
   document.getElementById('goalBm').value=g.bm;
   document.getElementById('goalCard').value=g.card;
+  renderSyncUI();
 }
 function saveSettings(){
   store.set('apiKey',document.getElementById('apiKeyInput').value.trim());
@@ -1254,6 +1275,143 @@ function resetData(){
   renderHome(); renderBrowse(); renderBm(); renderMy(); toast('초기화 완료');
 }
 
+/* ---------- CLOUD SYNC (Firebase) ---------- */
+const SYNC_KEYS=['days','stats','bookmarks','packs','goalsCfg','lastPack','model'];
+let fbUser=null, fbListening=false, cloudPulled=false, syncTimer=null;
+function getFbCfg(){ return store.get('fbConfig',null); }
+function parseFbCfg(text){
+  const m=String(text).match(/\{[\s\S]*\}/); if(!m) return null;
+  try{ const o=(new Function('return ('+m[0]+')'))(); return (o&&o.apiKey&&o.projectId)?o:null; }catch(e){ return null; }
+}
+function queueSync(k){
+  if(!fbUser||!cloudPulled) return;
+  if(!(SYNC_KEYS.includes(k)||k.startsWith('prog_'))) return;
+  clearTimeout(syncTimer);
+  syncTimer=setTimeout(()=>{ cloudPush().catch(e=>setSyncStatus('⚠️ 동기화 실패')); },2000);
+}
+function loadScript(src){ return new Promise((res,rej)=>{ const s=document.createElement('script'); s.src=src; s.onload=res; s.onerror=()=>rej(new Error('스크립트 로드 실패')); document.head.appendChild(s); }); }
+async function fbInit(){
+  const cfg=getFbCfg(); if(!cfg) return false;
+  if(!window.firebase){
+    const v='10.14.1';
+    await loadScript('https://www.gstatic.com/firebasejs/'+v+'/firebase-app-compat.js');
+    await loadScript('https://www.gstatic.com/firebasejs/'+v+'/firebase-auth-compat.js');
+    await loadScript('https://www.gstatic.com/firebasejs/'+v+'/firebase-firestore-compat.js');
+  }
+  if(!firebase.apps.length) firebase.initializeApp(cfg);
+  if(!fbListening){
+    fbListening=true;
+    firebase.auth().onAuthStateChanged(async u=>{
+      fbUser=u; renderSyncUI();
+      if(u){
+        try{ await cloudPull(); }
+        catch(e){ setSyncStatus('⚠️ 불러오기 실패 — Firestore 규칙을 확인해줘요'); }
+      }
+    });
+    try{ await firebase.auth().getRedirectResult(); }catch(e){}
+  }
+  return true;
+}
+async function fbLogin(){
+  const inp=document.getElementById('fbCfgInput');
+  if(inp&&inp.value.trim()){
+    const cfg=parseFbCfg(inp.value);
+    if(!cfg){ toast('설정을 인식 못했어요 — firebaseConfig 전체를 붙여넣어줘요'); return; }
+    store.set('fbConfig',cfg);
+  }
+  if(!getFbCfg()){ toast('먼저 Firebase 설정을 붙여넣어줘요 (README 참고!)'); return; }
+  try{
+    await fbInit();
+    const prov=new firebase.auth.GoogleAuthProvider();
+    try{ await firebase.auth().signInWithPopup(prov); }
+    catch(e){
+      if(String(e.code||'').indexOf('popup')>=0) await firebase.auth().signInWithRedirect(prov);
+      else throw e;
+    }
+  }catch(e){ toast('로그인 실패: '+(e.message||e)); }
+}
+function fbLogout(){
+  if(window.firebase&&firebase.apps.length) firebase.auth().signOut();
+  fbUser=null; cloudPulled=false; renderSyncUI(); toast('로그아웃 완료 (기록은 이 기기에 남아있어요)');
+}
+function setSyncStatus(t){ const el=document.getElementById('syncStatus'); if(el) el.textContent=t; }
+function renderSyncUI(){
+  const out=document.getElementById('syncLoggedOut'), inn=document.getElementById('syncLoggedIn');
+  if(!out) return;
+  if(fbUser){
+    out.style.display='none'; inn.style.display='block';
+    document.getElementById('syncEmail').textContent=fbUser.email||'구글 계정';
+  }else{
+    out.style.display='block'; inn.style.display='none';
+    const w=document.getElementById('fbSetupWrap'); if(w) w.style.display=getFbCfg()?'none':'block';
+  }
+}
+function allProgDays(){
+  const prog={};
+  try{ Object.keys(localStorage).forEach(k=>{ if(k.indexOf('lf_prog_')===0){ const day=k.slice(8); prog[day]=store.get('prog_'+day,null); } }); }catch(e){}
+  return prog;
+}
+async function cloudPush(){
+  if(!fbUser) return;
+  const db=firebase.firestore();
+  const uref=db.collection('users').doc(fbUser.uid);
+  const data={updatedAt:Date.now(), prog:allProgDays()};
+  SYNC_KEYS.forEach(k=>{ if(k==='packs') return; const v=store.get(k,null); if(v!=null) data[k]=v; });
+  await uref.set(data);
+  const packs=store.get('packs',[]);
+  const snap=await uref.collection('packs').get();
+  const remoteIds=new Set(); snap.forEach(d=>remoteIds.add(d.id));
+  const batch=db.batch();
+  packs.forEach(p=>{ batch.set(uref.collection('packs').doc(p.id),p); remoteIds.delete(p.id); });
+  remoteIds.forEach(id=>batch.delete(uref.collection('packs').doc(id)));
+  await batch.commit();
+  setSyncStatus('✅ 동기화 완료 · '+new Date().toLocaleTimeString());
+}
+async function cloudPull(){
+  if(!fbUser) return;
+  setSyncStatus('🔄 불러오는 중…');
+  const db=firebase.firestore();
+  const uref=db.collection('users').doc(fbUser.uid);
+  const doc=await uref.get();
+  const remote=doc.exists?doc.data():{};
+  const psnap=await uref.collection('packs').get();
+  const rPacks=[]; psnap.forEach(d=>rPacks.push(d.data()));
+  /* 스트릭 날짜: 합집합 */
+  const days=[...new Set([...store.get('days',[]),...(remote.days||[])])].sort();
+  store.set('days',days);
+  /* 누적 통계: 큰 값 */
+  const st=store.get('stats',{}); const rst=remote.stats||{};
+  Object.keys(rst).forEach(k=>{ st[k]=Math.max(st[k]||0,rst[k]||0); }); store.set('stats',st);
+  /* 북마크: 합치고 중복 제거 */
+  const bms=store.get('bookmarks',[]); const seen=new Set(bms.map(b=>b.type+'|'+norm(b.en)));
+  (remote.bookmarks||[]).forEach(b=>{ const key=b.type+'|'+norm(b.en); if(!seen.has(key)){ seen.add(key); bms.push(b); } });
+  bms.sort((a,b)=>String(b.date||'').localeCompare(String(a.date||'')));
+  store.set('bookmarks',bms);
+  /* 코스: id 기준 합치기 (이 기기 우선) */
+  const packs=store.get('packs',[]); const ids=new Set(packs.map(p=>p.id));
+  rPacks.forEach(p=>{ if(!ids.has(p.id)) packs.push(p); });
+  store.set('packs',packs);
+  /* 데일리 달성도: 날짜별로 큰 값 */
+  Object.entries(remote.prog||{}).forEach(([day,p])=>{
+    if(!p) return;
+    const key='prog_'+day; const lp=store.get(key,{quiz:0,bm:0,card:0});
+    ['quiz','bm','card'].forEach(k=>lp[k]=Math.max(lp[k]||0,p[k]||0));
+    store.set(key,lp);
+  });
+  /* 설정: 이 기기에 없을 때만 클라우드 값 사용 */
+  if(remote.goalsCfg&&store.get('goalsCfg',null)==null) store.set('goalsCfg',remote.goalsCfg);
+  if(remote.lastPack&&store.get('lastPack',null)==null) store.set('lastPack',remote.lastPack);
+  if(remote.model&&store.get('model',null)==null) store.set('model',remote.model);
+  cloudPulled=true;
+  await cloudPush();
+  try{ renderHome(); renderBrowse(); renderBm(); renderMy(); }catch(e){}
+}
+async function cloudSyncNow(){
+  if(!fbUser){ toast('먼저 로그인해줘요!'); return; }
+  try{ await cloudPull(); toast('☁️ 동기화 완료!'); }
+  catch(e){ setSyncStatus('⚠️ 동기화 실패'); toast('동기화 실패: '+(e.message||e)); }
+}
+
 /* ---------- INIT ---------- */
 function init(){
   recordVisit();
@@ -1261,6 +1419,7 @@ function init(){
   renderCallTopics();
   if('speechSynthesis' in window) speechSynthesis.getVoices();
   loadYTAPI();
+  if(getFbCfg()){ fbInit().catch(()=>{}); }
 }
 init();
 </script>
